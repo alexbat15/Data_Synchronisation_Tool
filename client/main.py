@@ -9,7 +9,7 @@ def hash_file(path):
         while chunk := f.read(1024 * 1024):
             sha256.update(chunk)
 
-    return sha256.hexdigest
+    return sha256.hexdigest()
 
 with open(path, "rb") as f:
     response = requests.post(
