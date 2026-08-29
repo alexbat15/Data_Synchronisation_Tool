@@ -1,12 +1,16 @@
 from pathlib import Path
 import hashlib
 import os
+import shutil
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 
 app = FastAPI()
 
 STORAGE_DIR = Path("server_storage")
 STORAGE_DIR.mkdir(exist_ok=True)
+
+TMP_DIR = Path("server_storage/tmp")
+TMP_DIR.mkdir(exist_ok=True)
 
 class file:
     name: str
@@ -34,6 +38,16 @@ def compare_file_hash(file_hash_1, file_hash_2):
     except Exception as e:
         print(f"failed to compare hash: {e}")
 
+#empty a directory
+def empty_directory(directory):
+    directory = Path(directory)
+
+    for item in directory.iterdir():
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+
 #Main API functions
 @app.get("/health")
 def heath():
@@ -45,9 +59,15 @@ async def upload_file(
     file_hash: str = Form(...)
     ):
     destination = STORAGE_DIR / file.filename
-    contents = await file.read()
 
-    server_file_hash = get_file_hash(destination)
+    #put files to a temp destination so that they can be hashed
+    tmp_destination = TMP_DIR / file.filename
+    contents = await file.read()
+    with open(tmp_destination, "wb") as f:
+                f.write(contents)
+    server_file_hash = get_file_hash(tmp_destination)
+
+    empty_directory(TMP_DIR)
 
     hash_matches = compare_file_hash(server_file_hash, file_hash)
 
