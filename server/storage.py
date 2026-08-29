@@ -1,5 +1,6 @@
 import sqlite3
 import pandas as pd
+import haashlib
 from pathlib import Path
 
 
@@ -24,6 +25,7 @@ class ServerManifestDB:
 
     #Create two tables, one for cchunks and one for files
     def _create_tables(self):
+        #build the chunk metadata table
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS server_file_chunks (
@@ -36,45 +38,83 @@ class ServerManifestDB:
             """
         )
         self.conn.commit()
-        self.conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS server_files (
-                        path TEXT NOT NULL,
-                        size INTEGER NOT NULL,
-                        mtime_ns INTEGER NOT NULL, 
-                        current_hash TEXT,
-                        last_synched_at INTEGER NOT NULL
-                        
-                        PRIMARY KEY (path, chunk_num),
 
-                        FOREIGN KEY (path)
-                            REFERENCES files(path)
-                            ON DELETE CASCADE
-                    )
-                    """
-                )
+        #build the file metadata table
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS server_files (
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL, 
+                current_hash TEXT,
+                last_synched_at INTEGER NOT NULL
+                
+                PRIMARY KEY (path, chunk_num),
+
+                FOREIGN KEY (path)
+                    REFERENCES files(path)
+                    ON DELETE CASCADE
+            )
+            """
+        )
         self.conn.commit()
 
     #chunk = {"path":str, "chunk_num": int, "size": int, "mtime_ns": int, "chunk_mtime_ns": int, "current_hash": str, "current_chunk_hash": str, "last_synched_at": str}
-    def lookup_chunk(self, chunk: dict):
+    def lookup_chunk(self, path:str, chunk_num:int):
         cursor = self.conn.execute(
             """
-                SELECT * FROM file_chunks WHERE path = ? AND chunk_num = ?
-            """, (chunk["path"], chunk["chunk_num"],)
+                SELECT * FROM server_file_chunks WHERE path = ? AND chunk_num = ?
+            """, (path, chunk_num,)
         )
         return cursor
 
-    def lookup_file(self, path):
+    def lookup_file(self, path:str):
         cursor = self.conn.execute(
             """
-                SELECT
-            """
+                SELECT * FROM server_files WHERE path = ?
+            """, (path,)
         )
+
+    #hash file
+    def hash_file(path):
+        sha256 = hashlib.sha256()
+
+        with open(path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                sha256.update(chunk)
+
+        return sha256.hexdigest()
+
+    #get metadata from stored file
+    def get_file_metadata(self, path, calculate_hash = True):
+        file_path = Path(path)
+        stat = file_path.stat()
+        size = stat.st_size #get the file size
+        mtime_ns = stat.st_mtime_ns #get the last modified time of the file
+        if calculate_hash == True:
+            file_hash = hashing.hash_file(path)
+            return size, mtime_ns, file_hash
+        return size, mtime_ns
+
+    def update_file(self, path:str, size:int, mtime_ns:int, current_hash:str):
+        cursor = self.conn.execute(
+            """
+                UPDATE server_files
+                SET
+                    size = ?,
+                    mtime_ns = ?,
+                    current_hash = ?,
+                    last_synched_at = CURRENT_TIMESTAMP
+                WHERE
+                    path = ?
+            """
+        ), (size,mtime_ns,current_hash,path,)
+        self.conn.commit()
     
     def upload_chunk(self, chunk: dict):
         self.conn.execute(
         """
-            INSERT INTO file_chunks (
+            INSERT INTO server_file_chunks (
                 path,
                 chunk_num,
                 size,

@@ -3,6 +3,7 @@ import hashlib
 import os
 import shutil
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import server.storage as storage
 
 app = FastAPI()
 
@@ -48,10 +49,60 @@ def empty_directory(directory):
         elif item.is_dir():
             shutil.rmtree(item)
 
-#Main API functions
+# ------ Main API functions ------
 @app.get("/health")
 def heath():
     return {"status": "ok"}
+
+@app.post("/files/init")
+async def init_file(
+        rel_file_path: str = Form(...),
+        file_hash: str = Form(...),
+        chunk_hashes: dict = Form(...)
+    ):
+
+    db = storage.ServerManifestDB()
+
+    destination = Path(f"{STORAGE_DIR}/{rel_file_path}")
+    file_data = db.lookup_file(rel_file_path)
+
+    chunks = {}
+    chunk_num = 0
+    while True:
+        try:
+            chunks["chunk_num"] = db.lookup_chunk(rel_file_path, chunk_num)
+            chunk_num += 1
+        except Exception:
+            break
+    all_keys = chunk_hashes.keys() | chunks.keys()
+
+    diff_dict = {
+        k: (chunk_hashes.get(k), chunks.get(k)) 
+        for k in all_keys 
+        if chunk_hashes.get(k) != chunks.get(k)
+    }
+    if file_hash == file_data["current_hash"]:
+        return {
+            "status":"success",
+            "up_to_date":"True",
+            "file_current_hash": file_data["current_hash"],
+            "changed_chunks": "",
+        }
+    elif  len(diff_dict) == 0:
+        return {
+            "status":"success",
+            "up_to_date":"True",
+            "file_current_hash": file_data["current_hash"],
+            "changed_chunks": "",
+        }
+    else:
+        return {
+            "status":"success",
+            "up_to_date":"False",
+            "file_current_hash": file_data["current_hash"],
+            "changed_chunks":diff_dict,
+        }
+    
 
 @app.post("/upload")
 async def upload_file(
