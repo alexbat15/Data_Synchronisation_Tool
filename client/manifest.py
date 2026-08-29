@@ -31,9 +31,9 @@ class ManifestDB:
                 size INTEGER NOT NULL,
                 mtime_ns INTEGER NOT NULL,
                 current_hash TEXT,
-                synced_hash TEXT,
+                synched_hash TEXT,
                 last_seen_at INTEGER,
-                last_synced_at TEXT
+                last_synched_at TEXT
             )
             """
         )
@@ -79,11 +79,11 @@ class ManifestDB:
                         path: str,
                         file_hash: str
                         ):
-        self.conn.executr(
+        self.conn.execute(
             """
             UPDATE files
             SET
-                synched_hash = ?
+                synched_hash = ?,
                 last_synched_at = CURRENT_TIMESTAMP
             WHERE path = ?
             """,
@@ -94,6 +94,7 @@ class ManifestDB:
         )
         self.conn.commit()
 
+    #inspect te sqlite database returning a pandas df.
     def inspect_db(self, print_rows=True):
         cursor = self.conn.execute("SELECT * FROM files")
         rows = cursor.fetchall()
@@ -107,12 +108,27 @@ class ManifestDB:
 
         return rows
 
+    def clear_table(self):
+        self.conn.execute("DELETE FROM files")
+        self.conn.commit()
+
+    def rename_col(self, old_name, new_name):
+        self.conn.execute(
+            f"""
+                ALTER TABLE files 
+                RENAME COLUMN {old_name} TO {new_name}
+            """
+        )
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
 
 
 if __name__ == "__main__":
     db = ManifestDB()
+    # db.rename_col("last_synced_at", "last_synched_at")
+    # db.clear_table()
     # db.add_file(
     #     path='test1.txt',
     #     size=500,
@@ -120,12 +136,12 @@ if __name__ == "__main__":
     #     current_hash='abcd1234'
     #     )
     
-    record = db.get_file("test.txt")
+    # record = db.get_file("test.txt")
 
-    if record is None:
-        print("We have never seen this file before.")
-    else:
-        print(record["current_hash"])
+    # if record is None:
+    #     print("We have never seen this file before.")
+    # else:
+    #     print(record["current_hash"])
 
     db.inspect_db()
     db.close()
