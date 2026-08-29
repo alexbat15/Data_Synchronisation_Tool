@@ -1,4 +1,5 @@
 .venv
+.worktrees/
 *.log
 *.pyc
 __pycache__/
