@@ -4,6 +4,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_SERVER_FILES_COLUMNS = (
+    ("path", "TEXT", 0, None, 1),
+    ("size", "INTEGER", 1, None, 0),
+    ("mtime_ns", "INTEGER", 1, None, 0),
+    ("chunk_size", "INTEGER", 1, None, 0),
+    ("current_hash", "TEXT", 1, None, 0),
+    ("last_synched_at", "TEXT", 1, "CURRENT_TIMESTAMP", 0),
+)
+_SERVER_FILE_CHUNKS_COLUMNS = (
+    ("path", "TEXT", 1, None, 1),
+    ("chunk_num", "INTEGER", 1, None, 2),
+    ("chunk_size", "INTEGER", 1, None, 0),
+    ("current_chunk_hash", "TEXT", 1, None, 0),
+)
+_SERVER_FILE_CHUNKS_FOREIGN_KEYS = (
+    ("server_files", "path", "path", "NO ACTION", "CASCADE", "NONE"),
+)
+
+
 @dataclass(frozen=True)
 class ChunkRecord:
     chunk_num: int
@@ -34,11 +53,12 @@ class ServerManifestDB:
         with self.conn:
             self._replace_incompatible_table(
                 "server_files",
-                ("path", "size", "mtime_ns", "chunk_size", "current_hash", "last_synched_at"),
+                _SERVER_FILES_COLUMNS,
             )
             self._replace_incompatible_table(
                 "server_file_chunks",
-                ("path", "chunk_num", "chunk_size", "current_chunk_hash"),
+                _SERVER_FILE_CHUNKS_COLUMNS,
+                _SERVER_FILE_CHUNKS_FOREIGN_KEYS,
             )
             self.conn.execute(
                 """
@@ -94,10 +114,41 @@ class ServerManifestDB:
             self.conn.execute("PRAGMA user_version = 1")
 
     def _replace_incompatible_table(
-        self, table_name: str, expected_columns: tuple[str, ...]
+        self,
+        table_name: str,
+        expected_columns: tuple[tuple[str, str, int, str | None, int], ...],
+        expected_foreign_keys: tuple[
+            tuple[str, str, str, str, str, str], ...
+        ] = (),
     ) -> None:
         columns = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        if not columns or tuple(column["name"] for column in columns) == expected_columns:
+        column_signature = tuple(
+            (
+                column["name"],
+                column["type"],
+                column["notnull"],
+                column["dflt_value"],
+                column["pk"],
+            )
+            for column in columns
+        )
+        foreign_key_signature = tuple(
+            (
+                foreign_key["table"],
+                foreign_key["from"],
+                foreign_key["to"],
+                foreign_key["on_update"],
+                foreign_key["on_delete"],
+                foreign_key["match"],
+            )
+            for foreign_key in self.conn.execute(
+                f"PRAGMA foreign_key_list({table_name})"
+            ).fetchall()
+        )
+        if not columns or (
+            column_signature == expected_columns
+            and foreign_key_signature == expected_foreign_keys
+        ):
             return
 
         suffix = ""
