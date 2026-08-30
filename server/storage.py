@@ -193,8 +193,31 @@ class ServerManifestDB:
         chunks: Sequence[ChunkRecord],
         *,
         clear_pending: bool = False,
-    ) -> None:
+        expected_pending_target_hash: str | None = None,
+    ) -> bool:
         with self.conn:
+            if expected_pending_target_hash is not None:
+                self.conn.execute("BEGIN IMMEDIATE")
+                pending_upload = self.get_pending_upload(path)
+                pending_chunks = [
+                    (row["chunk_num"], row["expected_size"], row["expected_hash"])
+                    for row in self.get_pending_chunks(path)
+                ]
+                expected_chunks = [
+                    (chunk.chunk_num, chunk.size, chunk.hash) for chunk in chunks
+                ]
+                if (
+                    pending_upload is None
+                    or (
+                        pending_upload["target_hash"],
+                        pending_upload["size"],
+                        pending_upload["chunk_size"],
+                    )
+                    != (expected_pending_target_hash, size, chunk_size)
+                    or pending_chunks != expected_chunks
+                ):
+                    return False
+
             self.conn.execute(
                 """
                 INSERT INTO server_files (path, size, mtime_ns, chunk_size, current_hash)
@@ -218,7 +241,16 @@ class ServerManifestDB:
                 ((path, chunk.chunk_num, chunk.size, chunk.hash) for chunk in chunks),
             )
             if clear_pending:
-                self.conn.execute("DELETE FROM pending_uploads WHERE path = ?", (path,))
+                if expected_pending_target_hash is None:
+                    self.conn.execute(
+                        "DELETE FROM pending_uploads WHERE path = ?", (path,)
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM pending_uploads WHERE path = ? AND target_hash = ?",
+                        (path, expected_pending_target_hash),
+                    )
+        return True
 
     def get_pending_upload(self, path: str) -> sqlite3.Row | None:
         return self.conn.execute(

@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
 from server.storage import ChunkRecord, ServerManifestDB
-from shared.models import FileInitRequest
+from shared.models import FileCompleteRequest, FileInitRequest
 
 
 DEFAULT_CHUNK_SIZE = 1024 * 1024
@@ -347,6 +347,198 @@ class ChunkUploadService:
             "status": "success",
             "chunk_num": chunk_num,
             "already_received": False,
+        }
+
+    def complete(self, request: FileCompleteRequest) -> dict:
+        path = normalize_relative_path(request.rel_file_path)
+        self._validate_hash(request.file_hash, "file hash")
+
+        with ServerManifestDB(self.db_path) as db:
+            pending_upload = db.get_pending_upload(path)
+            committed_file = db.get_file(path)
+
+        if pending_upload is None:
+            if committed_file is None:
+                raise UploadNotFoundError("no pending upload exists for file")
+            reconciled = self.reconcile_manifest(path, committed_file["chunk_size"])
+            if reconciled is None or reconciled["current_hash"] != request.file_hash:
+                raise UploadNotFoundError("no matching completed file exists")
+            return self._completion_response(path, request.file_hash, reconciled["size"])
+
+        if pending_upload["target_hash"] != request.file_hash:
+            raise UploadConflictError("file hash does not match pending upload")
+
+        self.reconcile_manifest(path, pending_upload["chunk_size"])
+        missing_chunks = self._missing_chunks(path, request.file_hash)
+        if missing_chunks:
+            raise MissingChunksError(missing_chunks)
+
+        pending_upload, expected_chunks, sources = self._completion_sources(
+            path, request.file_hash
+        )
+        newly_missing = [
+            chunk.chunk_num
+            for chunk, source in zip(expected_chunks, sources)
+            if source is None
+        ]
+        if newly_missing:
+            raise MissingChunksError(newly_missing)
+
+        session_dir = self._session_dir(path, request.file_hash)
+        assembled_path = session_dir / f"assembled.part.{uuid.uuid4().hex}"
+        destination = self.storage_dir / path
+        assembled_size = 0
+        assembled_hash = hashlib.sha256()
+
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            with assembled_path.open("xb") as assembled_file:
+                committed_source = None
+                try:
+                    if any(source and source[0] == "committed" for source in sources):
+                        committed_source = destination.open("rb")
+
+                    for expected, source in zip(expected_chunks, sources):
+                        if source[0] == "committed":
+                            committed_source.seek(
+                                expected.chunk_num * pending_upload["chunk_size"]
+                            )
+                            source_file = committed_source
+                            assembled_size += self._copy_source(
+                                source_file,
+                                assembled_file,
+                                expected.size,
+                                assembled_hash,
+                            )
+                        else:
+                            with source[1].open("rb") as source_file:
+                                assembled_size += self._copy_source(
+                                    source_file,
+                                    assembled_file,
+                                    expected.size,
+                                    assembled_hash,
+                                )
+                finally:
+                    if committed_source is not None:
+                        committed_source.close()
+
+                if (
+                    assembled_size != pending_upload["size"]
+                    or assembled_hash.hexdigest() != request.file_hash
+                ):
+                    raise InvalidUploadError(
+                        "assembled file does not match pending upload"
+                    )
+                assembled_file.flush()
+                os.fsync(assembled_file.fileno())
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(assembled_path, destination)
+            assembled_path = None
+
+            stat = destination.stat()
+            with ServerManifestDB(self.db_path) as db:
+                committed = db.replace_file(
+                    path,
+                    assembled_size,
+                    stat.st_mtime_ns,
+                    pending_upload["chunk_size"],
+                    request.file_hash,
+                    expected_chunks,
+                    clear_pending=True,
+                    expected_pending_target_hash=request.file_hash,
+                )
+            if not committed:
+                raise UploadConflictError(
+                    "pending upload changed while completing file"
+                )
+
+            shutil.rmtree(session_dir, ignore_errors=True)
+            return self._completion_response(path, request.file_hash, assembled_size)
+        finally:
+            if assembled_path is not None:
+                assembled_path.unlink(missing_ok=True)
+
+    def _missing_chunks(self, path: str, target_hash: str) -> list[int]:
+        _, expected_chunks, sources = self._completion_sources(path, target_hash)
+        return [
+            chunk.chunk_num
+            for chunk, source in zip(expected_chunks, sources)
+            if source is None
+        ]
+
+    def _completion_sources(
+        self, path: str, target_hash: str
+    ) -> tuple[sqlite3.Row, tuple[ChunkRecord, ...], list[tuple[str, Path | None] | None]]:
+        with ServerManifestDB(self.db_path) as db:
+            pending_upload = db.get_pending_upload(path)
+            if pending_upload is None:
+                raise UploadNotFoundError("no pending upload exists for file")
+            if pending_upload["target_hash"] != target_hash:
+                raise UploadConflictError("file hash does not match pending upload")
+
+            pending_chunks = db.get_pending_chunks(path)
+            committed_file = db.get_file(path)
+            committed_chunks = {
+                row["chunk_num"]: row for row in db.get_file_chunks(path)
+            }
+
+        expected_chunks = tuple(
+            ChunkRecord(row["chunk_num"], row["expected_size"], row["expected_hash"])
+            for row in pending_chunks
+        )
+        sources = []
+        for expected, pending_chunk in zip(expected_chunks, pending_chunks):
+            staged_path = self._chunk_path(path, target_hash, expected.chunk_num)
+            if (
+                pending_chunk["received_size"],
+                pending_chunk["received_hash"],
+            ) == (expected.size, expected.hash) and staged_path.is_file():
+                sources.append(("staged", staged_path))
+                continue
+
+            committed_chunk = committed_chunks.get(expected.chunk_num)
+            if (
+                committed_file is not None
+                and committed_chunk is not None
+                and (
+                    committed_chunk["chunk_num"],
+                    committed_chunk["chunk_size"],
+                    committed_chunk["current_chunk_hash"],
+                )
+                == (expected.chunk_num, expected.size, expected.hash)
+            ):
+                sources.append(("committed", None))
+            else:
+                sources.append(None)
+
+        return pending_upload, expected_chunks, sources
+
+    def _copy_source(
+        self,
+        source: BinaryIO,
+        destination: BinaryIO,
+        expected_size: int,
+        whole_hash,
+    ) -> int:
+        remaining = expected_size
+        copied = 0
+        while remaining:
+            data = source.read(min(HASH_BUFFER_SIZE, remaining))
+            if not data:
+                break
+            destination.write(data)
+            whole_hash.update(data)
+            copied += len(data)
+            remaining -= len(data)
+        return copied
+
+    def _completion_response(self, path: str, file_hash: str, size: int) -> dict:
+        return {
+            "status": "success",
+            "rel_file_path": path,
+            "file_hash": file_hash,
+            "bytes_written": size,
         }
 
     def _validate_hash(self, value: str, label: str) -> None:

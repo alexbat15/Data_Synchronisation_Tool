@@ -1,9 +1,11 @@
 import hashlib
+import os
 
 from fastapi.testclient import TestClient
 
 from server.main import create_app
 from server.storage import ChunkRecord, ServerManifestDB
+from shared.models import FileInitRequest
 
 
 def sha256(data: bytes) -> str:
@@ -307,3 +309,243 @@ def test_chunk_upload_rejects_short_stream_with_expected_chunk_hash(tmp_path):
 
     assert response.status_code == 400
     assert not staged_chunk_path(tmp_path, "data.bin", target, 0).exists()
+
+
+def test_complete_lists_missing_chunks(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefgh"
+    client.post("/files/init", json=init_payload("data.bin", target))
+    post_chunk(client, "data.bin", target, 0, b"abcd")
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "data.bin", "file_hash": sha256(target)},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["missing_chunks"] == [1]
+
+
+def test_complete_assembles_chunks_updates_manifest_and_is_idempotent(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefghij"
+    client.post("/files/init", json=init_payload("nested/data.bin", target))
+    post_chunk(client, "nested/data.bin", target, 0, b"abcd")
+    post_chunk(client, "nested/data.bin", target, 1, b"efgh")
+    post_chunk(client, "nested/data.bin", target, 2, b"ij")
+
+    body = {"rel_file_path": "nested/data.bin", "file_hash": sha256(target)}
+    first = client.post("/files/complete", json=body)
+    second = client.post("/files/complete", json=body)
+
+    assert first.json() == {
+        "status": "success",
+        "rel_file_path": "nested/data.bin",
+        "file_hash": sha256(target),
+        "bytes_written": len(target),
+    }
+    assert second.status_code == 200
+    assert (tmp_path / "nested" / "data.bin").read_bytes() == target
+    with ServerManifestDB(tmp_path / "server_state" / "server_manifest.db") as db:
+        assert db.get_pending_upload("nested/data.bin") is None
+        assert [
+            row["current_chunk_hash"]
+            for row in db.get_file_chunks("nested/data.bin")
+        ] == [sha256(b"abcd"), sha256(b"efgh"), sha256(b"ij")]
+
+
+def test_complete_reuses_unchanged_committed_chunk(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    original = b"aaaabbbb"
+    client.post(
+        "/upload",
+        files={"file": ("data.bin", original, "application/octet-stream")},
+        data={"file_hash": sha256(original)},
+    )
+    target = b"aaaacccc"
+    client.post("/files/init", json=init_payload("data.bin", target))
+    post_chunk(client, "data.bin", target, 1, b"cccc")
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "data.bin", "file_hash": sha256(target)},
+    )
+    assert response.status_code == 200
+    assert (tmp_path / "data.bin").read_bytes() == target
+
+
+def test_complete_rechecks_changed_reusable_source(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    original = b"aaaabbbb"
+    client.post(
+        "/upload",
+        files={"file": ("data.bin", original, "application/octet-stream")},
+        data={"file_hash": sha256(original)},
+    )
+    target = b"aaaacccc"
+    client.post("/files/init", json=init_payload("data.bin", target))
+    (tmp_path / "data.bin").write_bytes(b"zzzzbbbb")
+    post_chunk(client, "data.bin", target, 1, b"cccc")
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "data.bin", "file_hash": sha256(target)},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["missing_chunks"] == [0]
+
+
+def test_complete_publishes_empty_file(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    client.post("/files/init", json=init_payload("empty.bin", b""))
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "empty.bin", "file_hash": sha256(b"")},
+    )
+    assert response.status_code == 200
+    assert (tmp_path / "empty.bin").read_bytes() == b""
+
+
+def test_complete_rejects_inconsistent_file_and_chunk_hashes(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    actual = b"abcd"
+    payload = init_payload("data.bin", actual)
+    payload["file_hash"] = sha256(b"different target")
+    client.post("/files/init", json=payload)
+    upload = client.post(
+        "/files/chunks",
+        files={"chunk": ("0.chunk", actual, "application/octet-stream")},
+        data={
+            "rel_file_path": "data.bin",
+            "file_hash": payload["file_hash"],
+            "chunk_num": "0",
+            "chunk_hash": sha256(actual),
+        },
+    )
+    assert upload.status_code == 200
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "data.bin", "file_hash": payload["file_hash"]},
+    )
+    assert response.status_code == 400
+    assert not (tmp_path / "data.bin").exists()
+
+
+def test_complete_copies_staged_and_committed_sources_in_fixed_reads(
+    tmp_path, monkeypatch
+):
+    maximum_read_size = 64 * 1024
+    chunk_size = maximum_read_size * 2 + 3
+    unchanged_chunk = b"a" * chunk_size
+    original = unchanged_chunk + b"b" * chunk_size
+    target = unchanged_chunk + b"c" * chunk_size
+    app = create_app(tmp_path)
+    client = TestClient(app)
+    client.post(
+        "/upload",
+        files={"file": ("data.bin", original, "application/octet-stream")},
+        data={"file_hash": sha256(original)},
+    )
+    client.post(
+        "/files/init", json=init_payload("data.bin", target, chunk_size=chunk_size)
+    )
+    post_chunk(client, "data.bin", target, 1, target[chunk_size:])
+
+    committed_path = tmp_path / "data.bin"
+    staged_path = staged_chunk_path(tmp_path, "data.bin", target, 1)
+    original_open = type(committed_path).open
+    reads = {committed_path: [], staged_path: []}
+
+    class ReadSizeGuard:
+        def __init__(self, source, read_sizes):
+            self.source = source
+            self.read_sizes = read_sizes
+
+        def __enter__(self):
+            self.source.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.source.__exit__(exc_type, exc_value, traceback)
+
+        def __getattr__(self, name):
+            return getattr(self.source, name)
+
+        def read(self, size=-1):
+            assert 0 < size <= maximum_read_size
+            self.read_sizes.append(size)
+            return self.source.read(size)
+
+    def guarded_open(
+        self, mode="r", buffering=-1, encoding=None, errors=None, newline=None
+    ):
+        source = original_open(
+            self,
+            mode=mode,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+        if self in reads and mode == "rb":
+            return ReadSizeGuard(source, reads[self])
+        return source
+
+    monkeypatch.setattr(type(committed_path), "open", guarded_open)
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": "data.bin", "file_hash": sha256(target)},
+    )
+
+    assert response.status_code == 200
+    assert reads[committed_path] == [maximum_read_size, maximum_read_size, 3]
+    assert reads[staged_path] == [maximum_read_size, maximum_read_size, 3]
+
+
+def test_complete_does_not_commit_or_clear_a_replaced_pending_upload(
+    tmp_path, monkeypatch
+):
+    path = "data.bin"
+    version_a = b"abcdefgh"
+    version_b = b"abcdWXYZ"
+    app = create_app(tmp_path)
+    service = app.state.upload_service
+    client = TestClient(app)
+    client.post("/files/init", json=init_payload(path, version_a))
+    post_chunk(client, path, version_a, 0, b"abcd")
+    post_chunk(client, path, version_a, 1, b"efgh")
+    request_b = FileInitRequest(**init_payload(path, version_b))
+    original_replace = os.replace
+
+    def replace_then_start_version_b(source, destination):
+        original_replace(source, destination)
+        expected_b = [
+            ChunkRecord(index, len(chunk), sha256(chunk))
+            for index, chunk in enumerate((b"abcd", b"WXYZ"))
+        ]
+        with ServerManifestDB(service.db_path) as db:
+            db.start_upload(
+                path,
+                request_b.file_hash,
+                request_b.file_size,
+                request_b.chunk_size,
+                expected_b,
+            )
+
+    monkeypatch.setattr("server.chunking.os.replace", replace_then_start_version_b)
+
+    response = client.post(
+        "/files/complete",
+        json={"rel_file_path": path, "file_hash": sha256(version_a)},
+    )
+
+    assert response.status_code == 409
+    with ServerManifestDB(service.db_path) as db:
+        assert db.get_file(path) is None
+        pending = db.get_pending_upload(path)
+        assert pending["target_hash"] == sha256(version_b)
+        assert [row["expected_hash"] for row in db.get_pending_chunks(path)] == [
+            sha256(b"abcd"),
+            sha256(b"WXYZ"),
+        ]
