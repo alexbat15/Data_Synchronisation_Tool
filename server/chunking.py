@@ -54,7 +54,7 @@ def normalize_relative_path(raw_path: str) -> str:
     if (
         not normalized_text
         or normalized_text.startswith("/")
-        or re.match(r"^[A-Za-z]:($|/)", normalized_text)
+        or re.match(r"^[A-Za-z]:", normalized_text)
         or ".." in path.parts
         or path.as_posix() == "."
     ):
@@ -154,6 +154,7 @@ class ChunkUploadService:
                     DEFAULT_CHUNK_SIZE,
                     calculated_hash,
                     chunks,
+                    clear_pending=True,
                 )
 
             return {

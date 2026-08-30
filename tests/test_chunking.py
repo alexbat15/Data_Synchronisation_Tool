@@ -11,7 +11,9 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-@pytest.mark.parametrize("path", ["", "../escape.bin", "/absolute.bin", "C:/drive.bin"])
+@pytest.mark.parametrize(
+    "path", ["", "../escape.bin", "/absolute.bin", "C:/drive.bin", "C:relative.bin"]
+)
 def test_normalize_relative_path_rejects_unsafe_paths(path):
     with pytest.raises(InvalidUploadError):
         normalize_relative_path(path)
