@@ -233,10 +233,16 @@ class ChunkUploadService:
                         expected.size,
                         expected.hash,
                     ):
-                        db.mark_chunk_received(
-                            path, expected.chunk_num, expected.size, expected.hash
-                        )
-                        received_chunks.add(expected.chunk_num)
+                        if db.mark_chunk_received(
+                            path,
+                            request.file_hash,
+                            expected.chunk_num,
+                            expected.size,
+                            expected.hash,
+                            expected.size,
+                            expected.hash,
+                        ):
+                            received_chunks.add(expected.chunk_num)
                     else:
                         chunk_path.unlink()
 
@@ -291,8 +297,6 @@ class ChunkUploadService:
                 (pending_chunk["received_size"], pending_chunk["received_hash"])
                 == (pending_chunk["expected_size"], pending_chunk["expected_hash"])
                 and chunk_path.is_file()
-                and self._hash_file(chunk_path)
-                == (pending_chunk["expected_size"], pending_chunk["expected_hash"])
             ):
                 return {
                     "status": "success",
@@ -325,7 +329,16 @@ class ChunkUploadService:
 
                 os.replace(temporary_path, chunk_path)
                 temporary_path = None
-                db.mark_chunk_received(path, chunk_num, received_size, calculated_hash)
+                if not db.mark_chunk_received(
+                    path,
+                    file_hash,
+                    chunk_num,
+                    pending_chunk["expected_size"],
+                    pending_chunk["expected_hash"],
+                    received_size,
+                    calculated_hash,
+                ):
+                    raise UploadConflictError("pending upload changed while receiving chunk")
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)

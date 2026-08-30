@@ -1,9 +1,15 @@
 import hashlib
+import io
 import os
 
 import pytest
 
-from server.chunking import ChunkUploadService, InvalidUploadError, normalize_relative_path
+from server.chunking import (
+    ChunkUploadService,
+    InvalidUploadError,
+    UploadConflictError,
+    normalize_relative_path,
+)
 from server.storage import ChunkRecord, ServerManifestDB
 from shared.models import FileInitRequest
 
@@ -157,3 +163,83 @@ def test_init_crash_recovery_hashes_staged_chunk_in_fixed_reads(tmp_path, monkey
             len(content),
             sha256(content),
         )
+
+
+def test_receive_chunk_does_not_mark_a_replaced_pending_upload(tmp_path, monkeypatch):
+    path = "data.bin"
+    version_a = b"abcdefgh"
+    version_b = b"abcdWXYZ"
+    request_a = FileInitRequest(
+        rel_file_path=path,
+        file_hash=sha256(version_a),
+        file_size=len(version_a),
+        chunk_size=4,
+        chunk_hashes=[sha256(b"abcd"), sha256(b"efgh")],
+    )
+    request_b = FileInitRequest(
+        rel_file_path=path,
+        file_hash=sha256(version_b),
+        file_size=len(version_b),
+        chunk_size=4,
+        chunk_hashes=[sha256(b"abcd"), sha256(b"WXYZ")],
+    )
+    service = ChunkUploadService(tmp_path)
+    service.initialize(request_a)
+    original_replace = os.replace
+
+    def replace_then_initialize_b(source, destination):
+        original_replace(source, destination)
+        service.initialize(request_b)
+
+    monkeypatch.setattr("server.chunking.os.replace", replace_then_initialize_b)
+
+    with pytest.raises(UploadConflictError):
+        service.receive_chunk(
+            path,
+            sha256(version_a),
+            0,
+            sha256(b"abcd"),
+            io.BytesIO(b"abcd"),
+        )
+
+    with ServerManifestDB(tmp_path / "server_state" / "server_manifest.db") as db:
+        pending_upload = db.get_pending_upload(path)
+        pending_chunk = db.get_pending_chunk(path, 0)
+        assert pending_upload["target_hash"] == sha256(version_b)
+        assert pending_chunk["received_size"] is None
+        assert pending_chunk["received_hash"] is None
+
+
+def test_receive_chunk_retry_uses_received_metadata_without_rehashing_staged_file(
+    tmp_path, monkeypatch
+):
+    content = b"abcdefgh"
+    request = FileInitRequest(
+        rel_file_path="data.bin",
+        file_hash=sha256(content),
+        file_size=len(content),
+        chunk_size=4,
+        chunk_hashes=[sha256(b"abcd"), sha256(b"efgh")],
+    )
+    service = ChunkUploadService(tmp_path)
+    service.initialize(request)
+    service.receive_chunk(
+        "data.bin",
+        sha256(content),
+        0,
+        sha256(b"abcd"),
+        io.BytesIO(b"abcd"),
+    )
+
+    def unexpected_hash(*args, **kwargs):
+        raise AssertionError("ordinary retries must not scan staged chunks")
+
+    monkeypatch.setattr(service, "_hash_file", unexpected_hash)
+
+    assert service.receive_chunk(
+        "data.bin",
+        sha256(content),
+        0,
+        sha256(b"abcd"),
+        io.BytesIO(b"abcd"),
+    ) == {"status": "success", "chunk_num": 0, "already_received": True}

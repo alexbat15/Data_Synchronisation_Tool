@@ -16,7 +16,9 @@ def test_manifest_persists_committed_and_pending_chunks(tmp_path):
         resumed = db.start_upload(
             "folder/data.bin", "d" * 64, 6, 4, chunks
         )
-        db.mark_chunk_received("folder/data.bin", 1, 2, "b" * 64)
+        db.mark_chunk_received(
+            "folder/data.bin", "d" * 64, 1, 2, "b" * 64, 2, "b" * 64
+        )
 
     assert resumed is False
     with ServerManifestDB(db_path) as db:
@@ -49,7 +51,9 @@ def test_matching_pending_upload_resumes_received_chunks(tmp_path):
     chunks = [ChunkRecord(0, 4, "a" * 64)]
     with ServerManifestDB(db_path) as db:
         assert db.start_upload("data.bin", "b" * 64, 4, 4, chunks) is False
-        db.mark_chunk_received("data.bin", 0, 4, "a" * 64)
+        db.mark_chunk_received(
+            "data.bin", "b" * 64, 0, 4, "a" * 64, 4, "a" * 64
+        )
 
         assert db.start_upload("data.bin", "b" * 64, 4, 4, chunks) is True
         assert db.get_pending_chunk("data.bin", 0)["received_hash"] == "a" * 64
@@ -60,7 +64,9 @@ def test_mismatched_pending_upload_replaces_received_chunks(tmp_path):
     chunks = [ChunkRecord(0, 4, "a" * 64)]
     with ServerManifestDB(db_path) as db:
         db.start_upload("data.bin", "b" * 64, 4, 4, chunks)
-        db.mark_chunk_received("data.bin", 0, 4, "a" * 64)
+        db.mark_chunk_received(
+            "data.bin", "b" * 64, 0, 4, "a" * 64, 4, "a" * 64
+        )
 
         assert db.start_upload("data.bin", "c" * 64, 4, 4, chunks) is False
         pending = db.get_pending_chunk("data.bin", 0)
@@ -73,7 +79,9 @@ def test_clear_received_chunk_removes_received_metadata(tmp_path):
     chunks = [ChunkRecord(0, 4, "a" * 64)]
     with ServerManifestDB(db_path) as db:
         db.start_upload("data.bin", "b" * 64, 4, 4, chunks)
-        db.mark_chunk_received("data.bin", 0, 4, "a" * 64)
+        db.mark_chunk_received(
+            "data.bin", "b" * 64, 0, 4, "a" * 64, 4, "a" * 64
+        )
         db.clear_chunk_received("data.bin", 0)
 
         pending = db.get_pending_chunk("data.bin", 0)

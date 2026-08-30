@@ -287,21 +287,49 @@ class ServerManifestDB:
         return False
 
     def mark_chunk_received(
-        self, path: str, chunk_num: int, size: int, chunk_hash: str
-    ) -> None:
+        self,
+        path: str,
+        target_hash: str,
+        chunk_num: int,
+        expected_size: int,
+        expected_hash: str,
+        received_size: int,
+        received_hash: str,
+    ) -> bool:
         with self.conn:
-            self.conn.execute(
+            updated_chunk = self.conn.execute(
                 """
                 UPDATE pending_upload_chunks
                 SET received_size = ?, received_hash = ?, received_at = CURRENT_TIMESTAMP
                 WHERE path = ? AND chunk_num = ?
+                    AND expected_size = ? AND expected_hash = ?
+                    AND EXISTS (
+                        SELECT 1 FROM pending_uploads
+                        WHERE path = ? AND target_hash = ?
+                    )
                 """,
-                (size, chunk_hash, path, chunk_num),
+                (
+                    received_size,
+                    received_hash,
+                    path,
+                    chunk_num,
+                    expected_size,
+                    expected_hash,
+                    path,
+                    target_hash,
+                ),
             )
+            if updated_chunk.rowcount != 1:
+                return False
             self.conn.execute(
-                "UPDATE pending_uploads SET updated_at = CURRENT_TIMESTAMP WHERE path = ?",
-                (path,),
+                """
+                UPDATE pending_uploads
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE path = ? AND target_hash = ?
+                """,
+                (path, target_hash),
             )
+        return True
 
     def clear_chunk_received(self, path: str, chunk_num: int) -> None:
         with self.conn:

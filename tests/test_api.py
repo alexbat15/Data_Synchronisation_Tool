@@ -82,7 +82,15 @@ def test_init_resumes_a_chunk_recorded_before_restart(tmp_path):
     chunk_path.parent.mkdir(parents=True, exist_ok=True)
     chunk_path.write_bytes(b"abcd")
     with ServerManifestDB(tmp_path / "server_state" / "server_manifest.db") as db:
-        db.mark_chunk_received("data.bin", 0, 4, sha256(b"abcd"))
+        db.mark_chunk_received(
+            "data.bin",
+            sha256(target),
+            0,
+            4,
+            sha256(b"abcd"),
+            4,
+            sha256(b"abcd"),
+        )
 
     resumed = TestClient(create_app(tmp_path)).post("/files/init", json=payload)
     assert resumed.json()["missing_chunks"] == [1]
