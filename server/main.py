@@ -4,6 +4,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from server.chunking import ChunkUploadService, UploadProtocolError
+from shared.models import FileInitRequest
 
 
 def create_app(storage_dir: str | Path = Path("server_storage")) -> FastAPI:
@@ -22,6 +23,10 @@ def create_app(storage_dir: str | Path = Path("server_storage")) -> FastAPI:
     @app.post("/upload")
     def upload_file(file: UploadFile = File(...), file_hash: str = Form(...)):
         return service.store_whole_file(file.file, file.filename or "", file_hash)
+
+    @app.post("/files/init")
+    def init_file(request: FileInitRequest):
+        return service.initialize(request)
 
     return app
 
