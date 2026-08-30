@@ -13,6 +13,7 @@ from shared.models import FileInitRequest
 
 
 DEFAULT_CHUNK_SIZE = 1024 * 1024
+HASH_BUFFER_SIZE = 64 * 1024
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -227,8 +228,8 @@ class ChunkUploadService:
                     else:
                         db.clear_chunk_received(path, expected.chunk_num)
                 elif chunk_path.is_file():
-                    content = chunk_path.read_bytes()
-                    if (len(content), hashlib.sha256(content).hexdigest()) == (
+                    staged_size, staged_hash = self._hash_file(chunk_path)
+                    if (staged_size, staged_hash) == (
                         expected.size,
                         expected.hash,
                     ):
@@ -281,6 +282,16 @@ class ChunkUploadService:
     def _chunk_path(self, path: str, target_hash: str, chunk_num: int) -> Path:
         return self._session_dir(path, target_hash) / "chunks" / str(chunk_num)
 
+    def _hash_file(self, path: Path) -> tuple[int, str]:
+        whole_hash = hashlib.sha256()
+        size = 0
+
+        with path.open("rb") as source:
+            while data := source.read(HASH_BUFFER_SIZE):
+                whole_hash.update(data)
+                size += len(data)
+        return size, whole_hash.hexdigest()
+
     def _scan_file(self, path: Path, chunk_size: int) -> FileSnapshot:
         whole_hash = hashlib.sha256()
         chunks: list[ChunkRecord] = []
@@ -288,16 +299,36 @@ class ChunkUploadService:
 
         with path.open("rb") as source:
             chunk_num = 0
-            while data := source.read(chunk_size):
+            current_chunk_hash = hashlib.sha256()
+            current_chunk_size = 0
+            while data := source.read(HASH_BUFFER_SIZE):
                 whole_hash.update(data)
+                size += len(data)
+                view = memoryview(data)
+                offset = 0
+                while offset < len(view):
+                    take = min(chunk_size - current_chunk_size, len(view) - offset)
+                    current_chunk_hash.update(view[offset : offset + take])
+                    current_chunk_size += take
+                    offset += take
+                    if current_chunk_size == chunk_size:
+                        chunks.append(
+                            ChunkRecord(
+                                chunk_num=chunk_num,
+                                size=current_chunk_size,
+                                hash=current_chunk_hash.hexdigest(),
+                            )
+                        )
+                        chunk_num += 1
+                        current_chunk_hash = hashlib.sha256()
+                        current_chunk_size = 0
+            if current_chunk_size:
                 chunks.append(
                     ChunkRecord(
                         chunk_num=chunk_num,
-                        size=len(data),
-                        hash=hashlib.sha256(data).hexdigest(),
+                        size=current_chunk_size,
+                        hash=current_chunk_hash.hexdigest(),
                     )
                 )
-                chunk_num += 1
-                size += len(data)
 
         return FileSnapshot(size, whole_hash.hexdigest(), tuple(chunks))
