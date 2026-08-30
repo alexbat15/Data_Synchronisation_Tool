@@ -187,3 +187,115 @@ def test_legacy_upload_clears_pending_chunk_upload(tmp_path):
     with ServerManifestDB(tmp_path / "server_state" / "server_manifest.db") as db:
         assert db.get_pending_upload("nested.bin") is None
         assert db.get_pending_chunks("nested.bin") == []
+
+
+def post_chunk(client, path: str, target: bytes, index: int, chunk: bytes):
+    return client.post(
+        "/files/chunks",
+        files={"chunk": (f"{index}.chunk", chunk, "application/octet-stream")},
+        data={
+            "rel_file_path": path,
+            "file_hash": sha256(target),
+            "chunk_num": str(index),
+            "chunk_hash": sha256(chunk),
+        },
+    )
+
+
+def staged_chunk_path(tmp_path, path: str, target: bytes, index: int):
+    return (
+        tmp_path
+        / "tmp"
+        / "uploads"
+        / sha256(path.encode())
+        / sha256(target)
+        / "chunks"
+        / str(index)
+    )
+
+
+def test_chunk_upload_persists_and_retry_is_idempotent(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefgh"
+    client.post("/files/init", json=init_payload("data.bin", target))
+
+    first = post_chunk(client, "data.bin", target, 0, b"abcd")
+    second = post_chunk(client, "data.bin", target, 0, b"abcd")
+
+    assert first.json() == {
+        "status": "success",
+        "chunk_num": 0,
+        "already_received": False,
+    }
+    assert second.json() == {
+        "status": "success",
+        "chunk_num": 0,
+        "already_received": True,
+    }
+    resumed = client.post("/files/init", json=init_payload("data.bin", target))
+    assert resumed.json()["missing_chunks"] == [1]
+
+
+def test_chunk_upload_rejects_wrong_content_size_hash_index_and_version(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefgh"
+    client.post("/files/init", json=init_payload("data.bin", target))
+
+    wrong_content = post_chunk(client, "data.bin", target, 0, b"zzzz")
+    wrong_size = post_chunk(client, "data.bin", target, 0, b"abc")
+    wrong_index = post_chunk(client, "data.bin", target, 3, b"abcd")
+    wrong_version = client.post(
+        "/files/chunks",
+        files={"chunk": ("0.chunk", b"abcd", "application/octet-stream")},
+        data={
+            "rel_file_path": "data.bin",
+            "file_hash": "f" * 64,
+            "chunk_num": "0",
+            "chunk_hash": sha256(b"abcd"),
+        },
+    )
+
+    assert wrong_content.status_code == 400
+    assert wrong_size.status_code == 400
+    assert wrong_index.status_code == 400
+    assert wrong_version.status_code == 409
+
+
+def test_chunk_upload_rejects_corrupt_stream_with_expected_chunk_hash(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefgh"
+    client.post("/files/init", json=init_payload("data.bin", target))
+
+    response = client.post(
+        "/files/chunks",
+        files={"chunk": ("0.chunk", b"wxyz", "application/octet-stream")},
+        data={
+            "rel_file_path": "data.bin",
+            "file_hash": sha256(target),
+            "chunk_num": "0",
+            "chunk_hash": sha256(b"abcd"),
+        },
+    )
+
+    assert response.status_code == 400
+    assert not staged_chunk_path(tmp_path, "data.bin", target, 0).exists()
+
+
+def test_chunk_upload_rejects_short_stream_with_expected_chunk_hash(tmp_path):
+    client = TestClient(create_app(tmp_path))
+    target = b"abcdefgh"
+    client.post("/files/init", json=init_payload("data.bin", target))
+
+    response = client.post(
+        "/files/chunks",
+        files={"chunk": ("0.chunk", b"abc", "application/octet-stream")},
+        data={
+            "rel_file_path": "data.bin",
+            "file_hash": sha256(target),
+            "chunk_num": "0",
+            "chunk_hash": sha256(b"abcd"),
+        },
+    )
+
+    assert response.status_code == 400
+    assert not staged_chunk_path(tmp_path, "data.bin", target, 0).exists()

@@ -28,6 +28,18 @@ def create_app(storage_dir: str | Path = Path("server_storage")) -> FastAPI:
     def init_file(request: FileInitRequest):
         return service.initialize(request)
 
+    @app.post("/files/chunks")
+    def upload_chunk(
+        chunk: UploadFile = File(...),
+        rel_file_path: str = Form(...),
+        file_hash: str = Form(...),
+        chunk_num: int = Form(...),
+        chunk_hash: str = Form(...),
+    ):
+        return service.receive_chunk(
+            rel_file_path, file_hash, chunk_num, chunk_hash, chunk.file
+        )
+
     return app
 
 

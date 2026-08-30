@@ -253,6 +253,89 @@ class ChunkUploadService:
             "missing_chunks": missing_chunks,
         }
 
+    def receive_chunk(
+        self,
+        rel_file_path: str,
+        file_hash: str,
+        chunk_num: int,
+        chunk_hash: str,
+        stream: BinaryIO,
+    ) -> dict:
+        path = normalize_relative_path(rel_file_path)
+        self._validate_hash(file_hash, "file hash")
+        self._validate_hash(chunk_hash, "chunk hash")
+        if (
+            not isinstance(chunk_num, int)
+            or isinstance(chunk_num, bool)
+            or chunk_num < 0
+        ):
+            raise InvalidUploadError("chunk number must be a non-negative integer")
+
+        with ServerManifestDB(self.db_path) as db:
+            pending_upload = db.get_pending_upload(path)
+            if pending_upload is None:
+                raise UploadNotFoundError("no pending upload exists for file")
+            if pending_upload["target_hash"] != file_hash:
+                raise UploadConflictError("file hash does not match pending upload")
+
+            pending_chunk = db.get_pending_chunk(path, chunk_num)
+            if pending_chunk is None:
+                raise InvalidUploadError(
+                    "chunk number is not expected for pending upload"
+                )
+            if pending_chunk["expected_hash"] != chunk_hash:
+                raise InvalidUploadError("chunk hash does not match pending upload")
+
+            chunk_path = self._chunk_path(path, file_hash, chunk_num)
+            if (
+                (pending_chunk["received_size"], pending_chunk["received_hash"])
+                == (pending_chunk["expected_size"], pending_chunk["expected_hash"])
+                and chunk_path.is_file()
+                and self._hash_file(chunk_path)
+                == (pending_chunk["expected_size"], pending_chunk["expected_hash"])
+            ):
+                return {
+                    "status": "success",
+                    "chunk_num": chunk_num,
+                    "already_received": True,
+                }
+
+            temporary_path = chunk_path.with_name(
+                f"{chunk_path.name}.part.{uuid.uuid4().hex}"
+            )
+            received_hash = hashlib.sha256()
+            received_size = 0
+
+            try:
+                temporary_path.parent.mkdir(parents=True, exist_ok=True)
+                with temporary_path.open("xb") as temporary_file:
+                    while data := stream.read(HASH_BUFFER_SIZE):
+                        temporary_file.write(data)
+                        received_hash.update(data)
+                        received_size += len(data)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+
+                calculated_hash = received_hash.hexdigest()
+                if (received_size, calculated_hash) != (
+                    pending_chunk["expected_size"],
+                    pending_chunk["expected_hash"],
+                ):
+                    raise InvalidUploadError("chunk content does not match pending upload")
+
+                os.replace(temporary_path, chunk_path)
+                temporary_path = None
+                db.mark_chunk_received(path, chunk_num, received_size, calculated_hash)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+        return {
+            "status": "success",
+            "chunk_num": chunk_num,
+            "already_received": False,
+        }
+
     def _validate_hash(self, value: str, label: str) -> None:
         if not HASH_PATTERN.fullmatch(value):
             raise InvalidUploadError(f"{label} must be a lowercase SHA-256 hash")
