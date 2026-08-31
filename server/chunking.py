@@ -4,11 +4,12 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from collections.abc import Iterator
 from typing import BinaryIO
 
 from server.storage import ChunkRecord, ServerManifestDB
@@ -74,19 +75,14 @@ def normalize_relative_path(raw_path: str) -> str:
         or re.match(r"^[A-Za-z]:", normalized_text)
         or ".." in path.parts
         or path.as_posix() == "."
-        or path.parts[0].casefold() in RESERVED_TOP_LEVEL_NAMES
+        or path.parts[0].rstrip(" .").casefold() in RESERVED_TOP_LEVEL_NAMES
     ):
         raise InvalidUploadError("file path must be a safe relative path")
     return path.as_posix()
 
 
 class ChunkUploadService:
-    """Manage uploads with process-local same-path synchronization.
-
-    All service instances in this process share path locks. Deploy this application
-    with exactly one worker process; coordinating multiple processes requires an
-    external/distributed lock and is intentionally outside this service's contract.
-    """
+    """Manage uploads with same-path synchronization across server processes."""
 
     def __init__(self, storage_dir: str | Path):
         self.storage_dir = Path(storage_dir).resolve()
@@ -96,10 +92,19 @@ class ChunkUploadService:
         self.state_dir = self.storage_dir / "server_state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.state_dir / "server_manifest.db"
+        self.locks_dir = self.state_dir / "locks"
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_client_path(self, raw_path: str) -> tuple[str, Path]:
         path = normalize_relative_path(raw_path)
-        unresolved = self.storage_dir.joinpath(*PurePosixPath(path).parts)
+        parts = PurePosixPath(path).parts
+        for index in range(1, len(parts) + 1):
+            candidate = self.storage_dir.joinpath(*parts[:index])
+            is_junction = getattr(candidate, "is_junction", lambda: False)
+            if candidate.is_symlink() or is_junction():
+                raise InvalidUploadError("file path must not traverse a link")
+
+        unresolved = self.storage_dir.joinpath(*parts)
         try:
             destination = unresolved.resolve(strict=False)
             destination.relative_to(self.storage_dir)
@@ -107,11 +112,56 @@ class ChunkUploadService:
             raise InvalidUploadError(
                 "file path must resolve within the storage directory"
             ) from exc
+
+        for internal_dir in (self.state_dir, self.uploads_dir):
+            try:
+                destination.relative_to(internal_dir)
+            except ValueError:
+                continue
+            raise InvalidUploadError("file path must not target server internals")
+
+        if os.name == "nt":
+            path = path.casefold()
         return path, destination
 
     @contextmanager
+    def _cross_process_lock(self, path: str) -> Iterator[None]:
+        lock_name = hashlib.sha256(path.encode()).hexdigest() + ".lock"
+        lock_path = self.locks_dir / lock_name
+        with lock_path.open("a+b") as lock_file:
+            lock_file.seek(0)
+            if not lock_file.read(1):
+                lock_file.seek(0)
+                lock_file.write(b"\\0")
+                lock_file.flush()
+
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def _path_lock(self, path: str) -> Iterator[None]:
-        key = (os.path.normcase(str(self.storage_dir)), path)
+        key = (os.path.normcase(str(self.storage_dir)), os.path.normcase(path))
         with _PATH_LOCKS_GUARD:
             entry = _PATH_LOCKS.get(key)
             if entry is None:
@@ -121,7 +171,20 @@ class ChunkUploadService:
 
         try:
             with entry.lock:
-                yield
+                depth = getattr(entry, "lock_depth", 0)
+                if depth:
+                    entry.lock_depth = depth + 1
+                    try:
+                        yield
+                    finally:
+                        entry.lock_depth -= 1
+                else:
+                    with self._cross_process_lock(path):
+                        entry.lock_depth = 1
+                        try:
+                            yield
+                        finally:
+                            del entry.lock_depth
         finally:
             with _PATH_LOCKS_GUARD:
                 entry.users -= 1

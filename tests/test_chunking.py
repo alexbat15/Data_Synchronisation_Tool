@@ -1,5 +1,6 @@
 import hashlib
 import io
+import multiprocessing
 import os
 import subprocess
 import threading
@@ -55,6 +56,19 @@ def create_directory_link(link, target) -> None:
         )
 
 
+def hold_path_lock(storage_dir, path, acquired, release) -> None:
+    service = ChunkUploadService(storage_dir)
+    with service._path_lock(path):
+        acquired.set()
+        release.wait(timeout=10)
+
+
+def acquire_path_lock(storage_dir, path, acquired) -> None:
+    service = ChunkUploadService(storage_dir)
+    with service._path_lock(path):
+        acquired.set()
+
+
 @pytest.mark.parametrize(
     "path", ["", "../escape.bin", "/absolute.bin", "C:/drive.bin", "C:relative.bin"]
 )
@@ -65,7 +79,12 @@ def test_normalize_relative_path_rejects_unsafe_paths(path):
 
 @pytest.mark.parametrize(
     "path",
-    ["tmp/client.bin", "TMP/client.bin", "server_state/manifest.db"],
+    [
+        "tmp/client.bin",
+        "TMP/client.bin",
+        "tmp./client.bin",
+        "server_state/manifest.db",
+    ],
 )
 def test_normalize_relative_path_rejects_server_internal_namespaces(path):
     with pytest.raises(InvalidUploadError):
@@ -87,6 +106,58 @@ def test_whole_file_upload_rejects_resolved_directory_link_escape(tmp_path):
         )
 
     assert not (outside_dir / "escape.bin").exists()
+
+
+def test_whole_file_upload_rejects_link_to_server_internal_directory(tmp_path):
+    storage_dir = tmp_path / "storage"
+    storage_dir.mkdir()
+    service = ChunkUploadService(storage_dir)
+    manifest = service.state_dir / "server_manifest.db"
+    manifest.write_bytes(b"server manifest")
+    create_directory_link(storage_dir / "state_alias", service.state_dir)
+
+    with pytest.raises(InvalidUploadError):
+        service.store_whole_file(
+            io.BytesIO(b"replacement"),
+            "state_alias/server_manifest.db",
+            sha256(b"replacement"),
+        )
+
+    assert manifest.read_bytes() == b"server manifest"
+
+
+def test_path_lock_serializes_across_processes(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    first_acquired = context.Event()
+    second_acquired = context.Event()
+    release_first = context.Event()
+    first = context.Process(
+        target=hold_path_lock,
+        args=(tmp_path, "data.bin", first_acquired, release_first),
+    )
+    second = context.Process(
+        target=acquire_path_lock,
+        args=(tmp_path, "data.bin", second_acquired),
+    )
+
+    first.start()
+    try:
+        assert first_acquired.wait(timeout=5)
+        second.start()
+        assert not second_acquired.wait(timeout=0.3)
+        release_first.set()
+        assert second_acquired.wait(timeout=5)
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        if first.is_alive():
+            first.terminate()
+        if second.is_alive():
+            second.terminate()
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
 
 
 def test_reconcile_indexes_an_existing_file_once(tmp_path, monkeypatch):
