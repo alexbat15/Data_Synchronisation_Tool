@@ -1,144 +1,50 @@
 from pathlib import Path
-import hashlib
-import os
-import shutil
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-import server.storage as storage
 
-app = FastAPI()
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import JSONResponse
 
-STORAGE_DIR = Path("server_storage")
-STORAGE_DIR.mkdir(exist_ok=True)
+from server.chunking import ChunkUploadService, UploadProtocolError
+from shared.models import FileCompleteRequest, FileInitRequest
 
-TMP_DIR = Path("server_storage/tmp")
-TMP_DIR.mkdir(exist_ok=True)
 
-class file:
-    name: str
-    hash: str
+def create_app(storage_dir: str | Path = Path("server_storage")) -> FastAPI:
+    app = FastAPI()
+    service = ChunkUploadService(storage_dir)
+    app.state.upload_service = service
 
-# ------ helper functions ------
-#calculate has of one file from is contents using sha256
-def get_file_hash(file_path):
-    sha256 = hashlib.sha256()
+    @app.exception_handler(UploadProtocolError)
+    def upload_error_handler(request: Request, exc: UploadProtocolError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-    try:
-        with open(file_path, "rb") as f:
-            while chunk := f.read(8192):
-                sha256.update(chunk)
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
 
-        return sha256.hexdigest()
-    except Exception as e:
-        print(f"failed to calculate hash: {e}")
-        return
+    @app.post("/upload")
+    def upload_file(file: UploadFile = File(...), file_hash: str = Form(...)):
+        return service.store_whole_file(file.file, file.filename or "", file_hash)
 
-#compare 2 file hashes
-def compare_file_hash(file_hash_1, file_hash_2):
-    try:
-        return file_hash_1 == file_hash_2
-    except Exception as e:
-        print(f"failed to compare hash: {e}")
+    @app.post("/files/init")
+    def init_file(request: FileInitRequest):
+        return service.initialize(request)
 
-#empty a directory
-def empty_directory(directory):
-    directory = Path(directory)
-
-    for item in directory.iterdir():
-        if item.is_file():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
-
-# ------ Main API functions ------
-@app.get("/health")
-def heath():
-    return {"status": "ok"}
-
-@app.post("/files/init")
-async def init_file(
+    @app.post("/files/chunks")
+    def upload_chunk(
+        chunk: UploadFile = File(...),
         rel_file_path: str = Form(...),
         file_hash: str = Form(...),
-        chunk_hashes: dict = Form(...)
+        chunk_num: int = Form(...),
+        chunk_hash: str = Form(...),
     ):
+        return service.receive_chunk(
+            rel_file_path, file_hash, chunk_num, chunk_hash, chunk.file
+        )
 
-    db = storage.ServerManifestDB()
+    @app.post("/files/complete")
+    def complete_file(request: FileCompleteRequest):
+        return service.complete(request)
 
-    destination = Path(f"{STORAGE_DIR}/{rel_file_path}")
-    file_data = db.lookup_file(rel_file_path)
+    return app
 
-    chunks = {}
-    chunk_num = 0
-    while True:
-        try:
-            chunks["chunk_num"] = db.lookup_chunk(rel_file_path, chunk_num)
-            chunk_num += 1
-        except Exception:
-            break
-    all_keys = chunk_hashes.keys() | chunks.keys()
 
-    diff_dict = {
-        k: (chunk_hashes.get(k), chunks.get(k)) 
-        for k in all_keys 
-        if chunk_hashes.get(k) != chunks.get(k)
-    }
-    if file_hash == file_data["current_hash"]:
-        return {
-            "status":"success",
-            "up_to_date":"True",
-            "file_current_hash": file_data["current_hash"],
-            "changed_chunks": "",
-        }
-    elif  len(diff_dict) == 0:
-        return {
-            "status":"success",
-            "up_to_date":"True",
-            "file_current_hash": file_data["current_hash"],
-            "changed_chunks": "",
-        }
-    else:
-        return {
-            "status":"success",
-            "up_to_date":"False",
-            "file_current_hash": file_data["current_hash"],
-            "changed_chunks":diff_dict,
-        }
-    
-
-@app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...), 
-    file_hash: str = Form(...)
-    ):
-    destination = STORAGE_DIR / file.filename
-
-    #put files to a temp destination so that they can be hashed
-    tmp_destination = TMP_DIR / file.filename
-    contents = await file.read()
-    with open(tmp_destination, "wb") as f:
-                f.write(contents)
-    server_file_hash = get_file_hash(tmp_destination)
-
-    empty_directory(TMP_DIR)
-
-    hash_matches = compare_file_hash(server_file_hash, file_hash)
-
-    if hash_matches:
-        with open(destination, "wb") as f:
-            f.write(contents)
-
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "bytes_received": len(contents),
-            "calculated_hash": server_file_hash,
-            "posted_hash": file_hash,
-            "hash_matches": file_hash == server_file_hash,
-        }
-
-    if not hash_matches:
-        return {
-            "status": "failed",
-            "failure_message": "file hashes do not match",
-            "calculated_hash": server_file_hash,
-            "posted_hash": file_hash,
-        }
+app = create_app()
