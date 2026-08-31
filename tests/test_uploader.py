@@ -4,6 +4,8 @@ from pathlib import Path
 import requests
 
 from client.uploader import ChunkedUploader
+from client.manifest import ManifestDB
+from client.scanner import Scanner
 
 
 def sha256(data: bytes) -> str:
@@ -173,6 +175,67 @@ def test_sync_once_leaves_manifest_unsynched_when_completion_is_rejected(tmp_pat
             ),
             FakeResponse({"status": "success", "chunk_num": 0}),
             FakeResponse({"detail": "not complete"}, status_code=409),
+        ]
+    )
+    manifest = FakeManifest()
+    uploader = ChunkedUploader(
+        scanner=FakeScanner([changed_file(file_path, "data.bin")]),
+        manifest=manifest,
+        session=session,
+        chunk_size=3,
+    )
+
+    results = uploader.sync_once()
+
+    assert results == [{"path": "data.bin", "status": "failed"}]
+    assert manifest.synched == []
+
+
+def test_scanner_retries_an_unchanged_file_until_it_has_been_synched(
+    tmp_path, monkeypatch
+):
+    watched_dir = tmp_path / "watched"
+    watched_dir.mkdir()
+    file_path = watched_dir / "data.bin"
+    file_path.write_bytes(b"pending upload")
+    manifest = ManifestDB(tmp_path / "manifest.db")
+    monkeypatch.setattr("client.scanner.ManifestDB", lambda: manifest)
+    scanner = Scanner(watched_dir)
+
+    first_scan = scanner.get_file_status()
+    second_scan = scanner.get_file_status()
+    manifest.mark_as_synched(str(file_path), sha256(b"pending upload"))
+    third_scan = scanner.get_file_status()
+
+    assert first_scan[0]["changed"] is True
+    assert second_scan[0]["changed"] is True
+    assert third_scan[0]["changed"] is False
+    manifest.close()
+
+
+def test_sync_once_rejects_completion_acknowledging_another_path(tmp_path):
+    file_path = tmp_path / "data.bin"
+    file_path.write_bytes(b"abc")
+    file_hash = sha256(b"abc")
+    session = FakeSession(
+        [
+            FakeResponse(
+                {
+                    "status": "success",
+                    "up_to_date": False,
+                    "file_hash": file_hash,
+                    "missing_chunks": [0],
+                }
+            ),
+            FakeResponse({"status": "success", "chunk_num": 0}),
+            FakeResponse(
+                {
+                    "status": "success",
+                    "rel_file_path": "other.bin",
+                    "file_hash": file_hash,
+                    "bytes_written": 3,
+                }
+            ),
         ]
     )
     manifest = FakeManifest()

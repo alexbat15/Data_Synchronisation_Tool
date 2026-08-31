@@ -67,7 +67,10 @@ class FileCompare:
 
             return file_changed, current_hash
 
-        return False, stored_file["current_hash"]
+        return (
+            stored_file["current_hash"] != stored_file["synched_hash"],
+            stored_file["current_hash"],
+        )
 
 class Scanner:
     def __init__(self, data_path: str = "test_data/watched"):

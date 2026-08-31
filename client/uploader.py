@@ -89,6 +89,8 @@ class ChunkedUploader:
             },
         )
         self._require_matching_file_hash(complete_response, file_hash)
+        if complete_response.get("rel_file_path") != file_info["relative_path"]:
+            raise UploadProtocolError("server acknowledged a different file path")
 
     def _upload_chunk(
         self,
