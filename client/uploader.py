@@ -1,5 +1,5 @@
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import requests
 
@@ -54,6 +54,9 @@ class ChunkedUploader:
 
     def _sync_file(self, file_info: dict) -> None:
         file_path = Path(file_info["full_path"])
+        relative_path = PurePosixPath(
+            file_info["relative_path"].replace("\\", "/")
+        ).as_posix()
         file_size, file_hash, chunk_hashes = self._hash_chunks(file_path)
         if file_hash != file_info["current_hash"]:
             raise UploadProtocolError("file changed since the scan")
@@ -61,7 +64,7 @@ class ChunkedUploader:
         init_response = self._post_json(
             "/files/init",
             {
-                "rel_file_path": file_info["relative_path"],
+                "rel_file_path": relative_path,
                 "file_hash": file_hash,
                 "file_size": file_size,
                 "chunk_size": self.chunk_size,
@@ -75,7 +78,7 @@ class ChunkedUploader:
         for chunk_num in init_response.get("missing_chunks", []):
             self._upload_chunk(
                 file_path,
-                file_info["relative_path"],
+                relative_path,
                 file_hash,
                 chunk_hashes,
                 chunk_num,
@@ -84,12 +87,12 @@ class ChunkedUploader:
         complete_response = self._post_json(
             "/files/complete",
             {
-                "rel_file_path": file_info["relative_path"],
+                "rel_file_path": relative_path,
                 "file_hash": file_hash,
             },
         )
         self._require_matching_file_hash(complete_response, file_hash)
-        if complete_response.get("rel_file_path") != file_info["relative_path"]:
+        if complete_response.get("rel_file_path") != relative_path:
             raise UploadProtocolError("server acknowledged a different file path")
 
     def _upload_chunk(

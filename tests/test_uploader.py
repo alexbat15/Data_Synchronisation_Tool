@@ -88,7 +88,7 @@ def test_sync_once_posts_only_missing_chunks_completes_and_marks_manifest(tmp_pa
     )
     manifest = FakeManifest()
     uploader = ChunkedUploader(
-        scanner=FakeScanner([changed_file(file_path, "nested/data.bin")]),
+        scanner=FakeScanner([changed_file(file_path, "nested\\data.bin")]),
         manifest=manifest,
         session=session,
         chunk_size=3,
@@ -96,7 +96,7 @@ def test_sync_once_posts_only_missing_chunks_completes_and_marks_manifest(tmp_pa
 
     results = uploader.sync_once()
 
-    assert results == [{"path": "nested/data.bin", "status": "synced"}]
+    assert results == [{"path": "nested\\data.bin", "status": "synced"}]
     assert manifest.synched == [(str(file_path), file_hash)]
     assert session.calls[0] == (
         "http://127.0.0.1:8000/files/init",
