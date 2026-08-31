@@ -8,6 +8,7 @@ class FileCompare:
     def __init__(self):
         self.manifest = ManifestDB()
 
+    #pull metadata such as size and mtime for a file
     def get_file_metadata(self, path, calculate_hash = True):
         file_path = Path(path)
         stat = file_path.stat()
@@ -18,6 +19,7 @@ class FileCompare:
             return size, mtime_ns, file_hash
         return size, mtime_ns
 
+    #lookup a files current state in the SQLite db
     def lookup_file(self, path):
         file_metadata = self.manifest.get_file(path)
 
@@ -33,6 +35,7 @@ class FileCompare:
 
         return file_metadata
 
+    #compare current state to last synced state for a file
     def compare_current_synched(self, path):
         current_size, current_mtime_ns = self.get_file_metadata(
             path,

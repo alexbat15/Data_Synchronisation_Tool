@@ -14,7 +14,7 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
 class UploadProtocolError(Exception):
     """Raised when a successful HTTP response does not acknowledge an upload."""
 
-
+#Manages uploads of chunks
 class ChunkedUploader:
     def __init__(
         self,
@@ -33,6 +33,7 @@ class ChunkedUploader:
         self.server_url = server_url.rstrip("/")
         self.chunk_size = chunk_size
 
+    #performs one synchronisation pass over all files the scanner knows about
     def sync_once(self) -> list[dict[str, str]]:
         results = []
         for file_info in self.scanner.get_file_status():
@@ -52,6 +53,7 @@ class ChunkedUploader:
 
         return results
 
+    #synchronises a single file
     def _sync_file(self, file_info: dict) -> None:
         file_path = Path(file_info["full_path"])
         relative_path = PurePosixPath(
@@ -95,6 +97,7 @@ class ChunkedUploader:
         if complete_response.get("rel_file_path") != relative_path:
             raise UploadProtocolError("server acknowledged a different file path")
 
+    #uploads a single chunk
     def _upload_chunk(
         self,
         file_path: Path,
@@ -131,10 +134,11 @@ class ChunkedUploader:
         )
         self._success_payload(response)
 
+    #posts json payload to the server
     def _post_json(self, path: str, payload: dict) -> dict:
         response = self.session.post(f"{self.server_url}{path}", json=payload)
         return self._success_payload(response)
-
+    
     def _success_payload(self, response) -> dict:
         response.raise_for_status()
         payload = response.json()
