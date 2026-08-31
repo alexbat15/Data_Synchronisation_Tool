@@ -83,6 +83,8 @@ def test_normalize_relative_path_rejects_unsafe_paths(path):
         "tmp/client.bin",
         "TMP/client.bin",
         "tmp./client.bin",
+        "folder./client.bin",
+        "folder /client.bin",
         "server_state/manifest.db",
     ],
 )
@@ -158,6 +160,17 @@ def test_path_lock_serializes_across_processes(tmp_path):
 
     assert first.exitcode == 0
     assert second.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific path normalization")
+def test_windows_path_identity_uses_platform_normalization_not_casefold(tmp_path):
+    service = ChunkUploadService(tmp_path)
+
+    sharp_s, _ = service._resolve_client_path("straße.bin")
+    double_s, _ = service._resolve_client_path("strasse.bin")
+
+    assert sharp_s == os.path.normcase("straße.bin").replace("\\", "/")
+    assert sharp_s != double_s
 
 
 def test_reconcile_indexes_an_existing_file_once(tmp_path, monkeypatch):

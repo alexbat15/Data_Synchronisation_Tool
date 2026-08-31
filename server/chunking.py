@@ -75,7 +75,8 @@ def normalize_relative_path(raw_path: str) -> str:
         or re.match(r"^[A-Za-z]:", normalized_text)
         or ".." in path.parts
         or path.as_posix() == "."
-        or path.parts[0].rstrip(" .").casefold() in RESERVED_TOP_LEVEL_NAMES
+        or any(part.rstrip(" .") != part for part in path.parts)
+        or path.parts[0].casefold() in RESERVED_TOP_LEVEL_NAMES
     ):
         raise InvalidUploadError("file path must be a safe relative path")
     return path.as_posix()
@@ -121,7 +122,7 @@ class ChunkUploadService:
             raise InvalidUploadError("file path must not target server internals")
 
         if os.name == "nt":
-            path = path.casefold()
+            path = os.path.normcase(path).replace("\\", "/")
         return path, destination
 
     @contextmanager
