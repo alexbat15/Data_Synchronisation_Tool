@@ -199,6 +199,30 @@ def test_legacy_upload_clears_pending_chunk_upload(tmp_path):
         assert db.get_pending_chunks("nested.bin") == []
 
 
+def test_legacy_upload_removes_superseded_staged_session(tmp_path):
+    path = "nested.bin"
+    pending_content = b"older upload"
+    app = create_app(tmp_path)
+    service = app.state.upload_service
+    client = TestClient(app)
+    client.post("/files/init", json=init_payload(path, pending_content, len(pending_content)))
+    staged_session = service._session_dir(path, sha256(pending_content))
+    staged_session.mkdir(parents=True, exist_ok=True)
+    (staged_session / "orphan.chunk").write_bytes(pending_content)
+
+    replacement = b"legacy replacement"
+    response = client.post(
+        "/upload",
+        files={"file": (path, replacement, "application/octet-stream")},
+        data={"file_hash": sha256(replacement)},
+    )
+
+    assert response.status_code == 200
+    assert not staged_session.exists()
+    with ServerManifestDB(service.db_path) as db:
+        assert db.get_pending_upload(path) is None
+
+
 def post_chunk(client, path: str, target: bytes, index: int, chunk: bytes):
     return client.post(
         "/files/chunks",

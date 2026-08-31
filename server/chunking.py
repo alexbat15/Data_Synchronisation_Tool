@@ -3,9 +3,12 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from collections.abc import Iterator
 from typing import BinaryIO
 
 from server.storage import ChunkRecord, ServerManifestDB
@@ -15,6 +18,17 @@ from shared.models import FileCompleteRequest, FileInitRequest
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 HASH_BUFFER_SIZE = 64 * 1024
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+RESERVED_TOP_LEVEL_NAMES = frozenset({"server_state", "tmp"})
+
+
+class _PathLockEntry:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.users = 0
+
+
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[tuple[str, str], _PathLockEntry] = {}
 
 
 class UploadProtocolError(Exception):
@@ -60,12 +74,20 @@ def normalize_relative_path(raw_path: str) -> str:
         or re.match(r"^[A-Za-z]:", normalized_text)
         or ".." in path.parts
         or path.as_posix() == "."
+        or path.parts[0].casefold() in RESERVED_TOP_LEVEL_NAMES
     ):
         raise InvalidUploadError("file path must be a safe relative path")
     return path.as_posix()
 
 
 class ChunkUploadService:
+    """Manage uploads with process-local same-path synchronization.
+
+    All service instances in this process share path locks. Deploy this application
+    with exactly one worker process; coordinating multiple processes requires an
+    external/distributed lock and is intentionally outside this service's contract.
+    """
+
     def __init__(self, storage_dir: str | Path):
         self.storage_dir = Path(storage_dir).resolve()
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -75,13 +97,51 @@ class ChunkUploadService:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.state_dir / "server_manifest.db"
 
+    def _resolve_client_path(self, raw_path: str) -> tuple[str, Path]:
+        path = normalize_relative_path(raw_path)
+        unresolved = self.storage_dir.joinpath(*PurePosixPath(path).parts)
+        try:
+            destination = unresolved.resolve(strict=False)
+            destination.relative_to(self.storage_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InvalidUploadError(
+                "file path must resolve within the storage directory"
+            ) from exc
+        return path, destination
+
+    @contextmanager
+    def _path_lock(self, path: str) -> Iterator[None]:
+        key = (os.path.normcase(str(self.storage_dir)), path)
+        with _PATH_LOCKS_GUARD:
+            entry = _PATH_LOCKS.get(key)
+            if entry is None:
+                entry = _PathLockEntry()
+                _PATH_LOCKS[key] = entry
+            entry.users += 1
+
+        try:
+            with entry.lock:
+                yield
+        finally:
+            with _PATH_LOCKS_GUARD:
+                entry.users -= 1
+                if entry.users == 0:
+                    _PATH_LOCKS.pop(key, None)
+
     def reconcile_manifest(
         self, rel_file_path: str, chunk_size: int
     ) -> sqlite3.Row | None:
-        path = normalize_relative_path(rel_file_path)
+        path, _ = self._resolve_client_path(rel_file_path)
         if chunk_size <= 0:
             raise InvalidUploadError("chunk size must be positive")
-        destination = self.storage_dir / path
+
+        with self._path_lock(path):
+            _, destination = self._resolve_client_path(path)
+            return self._reconcile_manifest_locked(path, destination, chunk_size)
+
+    def _reconcile_manifest_locked(
+        self, path: str, destination: Path, chunk_size: int
+    ) -> sqlite3.Row | None:
 
         with ServerManifestDB(self.db_path) as db:
             existing = db.get_file(path)
@@ -112,7 +172,7 @@ class ChunkUploadService:
     def store_whole_file(
         self, stream: BinaryIO, rel_file_path: str, file_hash: str
     ) -> dict:
-        path = normalize_relative_path(rel_file_path)
+        path, _ = self._resolve_client_path(rel_file_path)
         if not HASH_PATTERN.fullmatch(file_hash):
             raise InvalidUploadError("file hash must be a lowercase SHA-256 hash")
 
@@ -143,22 +203,30 @@ class ChunkUploadService:
             if calculated_hash != file_hash:
                 raise InvalidUploadError("file hash does not match uploaded content")
 
-            destination = self.storage_dir / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(temporary_path, destination)
-            temporary_path = None
+            with self._path_lock(path):
+                _, destination = self._resolve_client_path(path)
+                with ServerManifestDB(self.db_path) as db:
+                    pending_upload = db.get_pending_upload(path)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(temporary_path, destination)
+                    temporary_path = None
 
-            stat = destination.stat()
-            with ServerManifestDB(self.db_path) as db:
-                db.replace_file(
-                    path,
-                    size,
-                    stat.st_mtime_ns,
-                    DEFAULT_CHUNK_SIZE,
-                    calculated_hash,
-                    chunks,
-                    clear_pending=True,
-                )
+                    stat = destination.stat()
+                    db.replace_file(
+                        path,
+                        size,
+                        stat.st_mtime_ns,
+                        DEFAULT_CHUNK_SIZE,
+                        calculated_hash,
+                        chunks,
+                        clear_pending=True,
+                    )
+
+                if pending_upload is not None:
+                    shutil.rmtree(
+                        self._session_dir(path, pending_upload["target_hash"]),
+                        ignore_errors=True,
+                    )
 
             return {
                 "status": "success",
@@ -173,91 +241,103 @@ class ChunkUploadService:
                 temporary_path.unlink(missing_ok=True)
 
     def initialize(self, request: FileInitRequest) -> dict:
-        path = normalize_relative_path(request.rel_file_path)
+        path, _ = self._resolve_client_path(request.rel_file_path)
         self._validate_hash(request.file_hash, "file hash")
         expected_chunks = self._expected_chunks(request)
         session_dir = self._session_dir(path, request.file_hash)
 
-        manifest = self.reconcile_manifest(path, request.chunk_size)
-        if manifest is not None and manifest["current_hash"] == request.file_hash:
-            with ServerManifestDB(self.db_path) as db:
-                db.delete_pending_upload(path)
-            shutil.rmtree(session_dir.parent, ignore_errors=True)
-            return {
-                "status": "success",
-                "up_to_date": True,
-                "file_hash": request.file_hash,
-                "missing_chunks": [],
-            }
-
-        with ServerManifestDB(self.db_path) as db:
-            prior = db.get_pending_upload(path)
-            db.start_upload(
-                path,
-                request.file_hash,
-                request.file_size,
-                request.chunk_size,
-                expected_chunks,
+        with self._path_lock(path):
+            _, destination = self._resolve_client_path(path)
+            manifest = self._reconcile_manifest_locked(
+                path, destination, request.chunk_size
             )
-            if prior is not None and prior["target_hash"] != request.file_hash:
-                shutil.rmtree(self._session_dir(path, prior["target_hash"]), ignore_errors=True)
+            if manifest is not None and manifest["current_hash"] == request.file_hash:
+                with ServerManifestDB(self.db_path) as db:
+                    db.delete_pending_upload(path)
+                shutil.rmtree(session_dir.parent, ignore_errors=True)
+                return {
+                    "status": "success",
+                    "up_to_date": True,
+                    "file_hash": request.file_hash,
+                    "missing_chunks": [],
+                }
 
-            pending_chunks = {
-                row["chunk_num"]: row for row in db.get_pending_chunks(path)
-            }
-            reusable_chunks = {
-                row["chunk_num"]
-                for row in db.get_file_chunks(path)
-                if row["chunk_num"] < len(expected_chunks)
-                and (row["chunk_size"], row["current_chunk_hash"])
-                == (
-                    expected_chunks[row["chunk_num"]].size,
-                    expected_chunks[row["chunk_num"]].hash,
+            with ServerManifestDB(self.db_path) as db:
+                prior = db.get_pending_upload(path)
+                db.start_upload(
+                    path,
+                    request.file_hash,
+                    request.file_size,
+                    request.chunk_size,
+                    expected_chunks,
                 )
-            }
-            received_chunks = set()
-            for expected in expected_chunks:
-                pending = pending_chunks[expected.chunk_num]
-                chunk_path = self._chunk_path(path, request.file_hash, expected.chunk_num)
-                if pending["received_size"] is not None or pending["received_hash"] is not None:
+                if prior is not None and prior["target_hash"] != request.file_hash:
+                    shutil.rmtree(
+                        self._session_dir(path, prior["target_hash"]),
+                        ignore_errors=True,
+                    )
+
+                pending_chunks = {
+                    row["chunk_num"]: row for row in db.get_pending_chunks(path)
+                }
+                reusable_chunks = {
+                    row["chunk_num"]
+                    for row in db.get_file_chunks(path)
+                    if row["chunk_num"] < len(expected_chunks)
+                    and (row["chunk_size"], row["current_chunk_hash"])
+                    == (
+                        expected_chunks[row["chunk_num"]].size,
+                        expected_chunks[row["chunk_num"]].hash,
+                    )
+                }
+                received_chunks = set()
+                for expected in expected_chunks:
+                    pending = pending_chunks[expected.chunk_num]
+                    chunk_path = self._chunk_path(
+                        path, request.file_hash, expected.chunk_num
+                    )
                     if (
-                        pending["received_size"],
-                        pending["received_hash"],
-                    ) == (expected.size, expected.hash) and chunk_path.is_file():
-                        received_chunks.add(expected.chunk_num)
-                    else:
-                        db.clear_chunk_received(path, expected.chunk_num)
-                elif chunk_path.is_file():
-                    staged_size, staged_hash = self._hash_file(chunk_path)
-                    if (staged_size, staged_hash) == (
-                        expected.size,
-                        expected.hash,
+                        pending["received_size"] is not None
+                        or pending["received_hash"] is not None
                     ):
-                        if db.mark_chunk_received(
-                            path,
-                            request.file_hash,
-                            expected.chunk_num,
-                            expected.size,
-                            expected.hash,
+                        if (
+                            pending["received_size"],
+                            pending["received_hash"],
+                        ) == (expected.size, expected.hash) and chunk_path.is_file():
+                            received_chunks.add(expected.chunk_num)
+                        else:
+                            db.clear_chunk_received(path, expected.chunk_num)
+                    elif chunk_path.is_file():
+                        staged_size, staged_hash = self._hash_file(chunk_path)
+                        if (staged_size, staged_hash) == (
                             expected.size,
                             expected.hash,
                         ):
-                            received_chunks.add(expected.chunk_num)
-                    else:
-                        chunk_path.unlink()
+                            if db.mark_chunk_received(
+                                path,
+                                request.file_hash,
+                                expected.chunk_num,
+                                expected.size,
+                                expected.hash,
+                                expected.size,
+                                expected.hash,
+                            ):
+                                received_chunks.add(expected.chunk_num)
+                        else:
+                            chunk_path.unlink()
 
-        missing_chunks = [
-            chunk.chunk_num
-            for chunk in expected_chunks
-            if chunk.chunk_num not in received_chunks
-            and chunk.chunk_num not in reusable_chunks
-        ]
-        return {
-            "status": "success",
-            "up_to_date": False,
-            "file_hash": request.file_hash,
-            "missing_chunks": missing_chunks,
-        }
+            missing_chunks = [
+                chunk.chunk_num
+                for chunk in expected_chunks
+                if chunk.chunk_num not in received_chunks
+                and chunk.chunk_num not in reusable_chunks
+            ]
+            return {
+                "status": "success",
+                "up_to_date": False,
+                "file_hash": request.file_hash,
+                "missing_chunks": missing_chunks,
+            }
 
     def receive_chunk(
         self,
@@ -267,7 +347,7 @@ class ChunkUploadService:
         chunk_hash: str,
         stream: BinaryIO,
     ) -> dict:
-        path = normalize_relative_path(rel_file_path)
+        path, _ = self._resolve_client_path(rel_file_path)
         self._validate_hash(file_hash, "file hash")
         self._validate_hash(chunk_hash, "chunk hash")
         if (
@@ -277,6 +357,20 @@ class ChunkUploadService:
         ):
             raise InvalidUploadError("chunk number must be a non-negative integer")
 
+        with self._path_lock(path):
+            self._resolve_client_path(path)
+            return self._receive_chunk_locked(
+                path, file_hash, chunk_num, chunk_hash, stream
+            )
+
+    def _receive_chunk_locked(
+        self,
+        path: str,
+        file_hash: str,
+        chunk_num: int,
+        chunk_hash: str,
+        stream: BinaryIO,
+    ) -> dict:
         with ServerManifestDB(self.db_path) as db:
             pending_upload = db.get_pending_upload(path)
             if pending_upload is None:
@@ -338,6 +432,10 @@ class ChunkUploadService:
                     received_size,
                     calculated_hash,
                 ):
+                    try:
+                        chunk_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     raise UploadConflictError("pending upload changed while receiving chunk")
             finally:
                 if temporary_path is not None:
@@ -350,9 +448,16 @@ class ChunkUploadService:
         }
 
     def complete(self, request: FileCompleteRequest) -> dict:
-        path = normalize_relative_path(request.rel_file_path)
+        path, _ = self._resolve_client_path(request.rel_file_path)
         self._validate_hash(request.file_hash, "file hash")
 
+        with self._path_lock(path):
+            _, destination = self._resolve_client_path(path)
+            return self._complete_locked(path, destination, request.file_hash)
+
+    def _complete_locked(
+        self, path: str, destination: Path, file_hash: str
+    ) -> dict:
         with ServerManifestDB(self.db_path) as db:
             pending_upload = db.get_pending_upload(path)
             committed_file = db.get_file(path)
@@ -360,21 +465,23 @@ class ChunkUploadService:
         if pending_upload is None:
             if committed_file is None:
                 raise UploadNotFoundError("no pending upload exists for file")
-            reconciled = self.reconcile_manifest(path, committed_file["chunk_size"])
-            if reconciled is None or reconciled["current_hash"] != request.file_hash:
+            reconciled = self._reconcile_manifest_locked(
+                path, destination, committed_file["chunk_size"]
+            )
+            if reconciled is None or reconciled["current_hash"] != file_hash:
                 raise UploadNotFoundError("no matching completed file exists")
-            return self._completion_response(path, request.file_hash, reconciled["size"])
+            return self._completion_response(path, file_hash, reconciled["size"])
 
-        if pending_upload["target_hash"] != request.file_hash:
+        if pending_upload["target_hash"] != file_hash:
             raise UploadConflictError("file hash does not match pending upload")
 
-        self.reconcile_manifest(path, pending_upload["chunk_size"])
-        missing_chunks = self._missing_chunks(path, request.file_hash)
+        self._reconcile_manifest_locked(path, destination, pending_upload["chunk_size"])
+        missing_chunks = self._missing_chunks(path, file_hash)
         if missing_chunks:
             raise MissingChunksError(missing_chunks)
 
         pending_upload, expected_chunks, sources = self._completion_sources(
-            path, request.file_hash
+            path, file_hash
         )
         newly_missing = [
             chunk.chunk_num
@@ -384,9 +491,8 @@ class ChunkUploadService:
         if newly_missing:
             raise MissingChunksError(newly_missing)
 
-        session_dir = self._session_dir(path, request.file_hash)
+        session_dir = self._session_dir(path, file_hash)
         assembled_path = session_dir / f"assembled.part.{uuid.uuid4().hex}"
-        destination = self.storage_dir / path
         assembled_size = 0
         assembled_hash = hashlib.sha256()
 
@@ -424,7 +530,7 @@ class ChunkUploadService:
 
                 if (
                     assembled_size != pending_upload["size"]
-                    or assembled_hash.hexdigest() != request.file_hash
+                    or assembled_hash.hexdigest() != file_hash
                 ):
                     raise InvalidUploadError(
                         "assembled file does not match pending upload"
@@ -443,10 +549,10 @@ class ChunkUploadService:
                     assembled_size,
                     stat.st_mtime_ns,
                     pending_upload["chunk_size"],
-                    request.file_hash,
+                    file_hash,
                     expected_chunks,
                     clear_pending=True,
-                    expected_pending_target_hash=request.file_hash,
+                    expected_pending_target_hash=file_hash,
                 )
             if not committed:
                 raise UploadConflictError(
@@ -454,7 +560,7 @@ class ChunkUploadService:
                 )
 
             shutil.rmtree(session_dir, ignore_errors=True)
-            return self._completion_response(path, request.file_hash, assembled_size)
+            return self._completion_response(path, file_hash, assembled_size)
         finally:
             if assembled_path is not None:
                 assembled_path.unlink(missing_ok=True)

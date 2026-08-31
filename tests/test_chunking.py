@@ -1,6 +1,8 @@
 import hashlib
 import io
 import os
+import subprocess
+import threading
 
 import pytest
 
@@ -11,7 +13,7 @@ from server.chunking import (
     normalize_relative_path,
 )
 from server.storage import ChunkRecord, ServerManifestDB
-from shared.models import FileInitRequest
+from shared.models import FileCompleteRequest, FileInitRequest
 
 
 HASH_BUFFER_SIZE = 64 * 1024
@@ -40,12 +42,51 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def create_directory_link(link, target) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+        )
+
+
 @pytest.mark.parametrize(
     "path", ["", "../escape.bin", "/absolute.bin", "C:/drive.bin", "C:relative.bin"]
 )
 def test_normalize_relative_path_rejects_unsafe_paths(path):
     with pytest.raises(InvalidUploadError):
         normalize_relative_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["tmp/client.bin", "TMP/client.bin", "server_state/manifest.db"],
+)
+def test_normalize_relative_path_rejects_server_internal_namespaces(path):
+    with pytest.raises(InvalidUploadError):
+        normalize_relative_path(path)
+
+
+def test_whole_file_upload_rejects_resolved_directory_link_escape(tmp_path):
+    storage_dir = tmp_path / "storage"
+    outside_dir = tmp_path / "outside"
+    storage_dir.mkdir()
+    outside_dir.mkdir()
+    create_directory_link(storage_dir / "linked", outside_dir)
+    service = ChunkUploadService(storage_dir)
+    content = b"must stay inside storage"
+
+    with pytest.raises(InvalidUploadError):
+        service.store_whole_file(
+            io.BytesIO(content), "linked/escape.bin", sha256(content)
+        )
+
+    assert not (outside_dir / "escape.bin").exists()
 
 
 def test_reconcile_indexes_an_existing_file_once(tmp_path, monkeypatch):
@@ -210,6 +251,40 @@ def test_receive_chunk_does_not_mark_a_replaced_pending_upload(tmp_path, monkeyp
         assert pending_chunk["received_hash"] is None
 
 
+def test_receive_chunk_removes_artifact_when_manifest_update_is_rejected(
+    tmp_path, monkeypatch
+):
+    path = "data.bin"
+    content = b"abcdefgh"
+    target_hash = sha256(content)
+    service = ChunkUploadService(tmp_path)
+    service.initialize(
+        FileInitRequest(
+            rel_file_path=path,
+            file_hash=target_hash,
+            file_size=len(content),
+            chunk_size=4,
+            chunk_hashes=[sha256(b"abcd"), sha256(b"efgh")],
+        )
+    )
+    monkeypatch.setattr(
+        ServerManifestDB,
+        "mark_chunk_received",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(UploadConflictError):
+        service.receive_chunk(
+            path,
+            target_hash,
+            0,
+            sha256(b"abcd"),
+            io.BytesIO(b"abcd"),
+        )
+
+    assert not service._chunk_path(path, target_hash, 0).exists()
+
+
 def test_receive_chunk_retry_uses_received_metadata_without_rehashing_staged_file(
     tmp_path, monkeypatch
 ):
@@ -243,3 +318,130 @@ def test_receive_chunk_retry_uses_received_metadata_without_rehashing_staged_fil
         sha256(b"abcd"),
         io.BytesIO(b"abcd"),
     ) == {"status": "success", "chunk_num": 0, "already_received": True}
+
+
+def test_newer_legacy_upload_cannot_be_overtaken_by_older_completion(
+    tmp_path, monkeypatch
+):
+    path = "data.bin"
+    older = b"older-v1"
+    newer = b"newer-v2"
+    service = ChunkUploadService(tmp_path)
+    older_request = FileInitRequest(
+        **{
+            "rel_file_path": path,
+            "file_hash": sha256(older),
+            "file_size": len(older),
+            "chunk_size": len(older),
+            "chunk_hashes": [sha256(older)],
+        }
+    )
+    service.initialize(older_request)
+    service.receive_chunk(
+        path,
+        sha256(older),
+        0,
+        sha256(older),
+        io.BytesIO(older),
+    )
+
+    older_copy_paused = threading.Event()
+    release_older_copy = threading.Event()
+    newer_finished = threading.Event()
+    errors = {}
+    original_copy_source = service._copy_source
+
+    def pausing_copy_source(*args, **kwargs):
+        older_copy_paused.set()
+        assert release_older_copy.wait(timeout=5)
+        return original_copy_source(*args, **kwargs)
+
+    def complete_older():
+        try:
+            service.complete(
+                FileCompleteRequest(rel_file_path=path, file_hash=sha256(older))
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors["older"] = exc
+
+    def upload_newer():
+        try:
+            service.store_whole_file(io.BytesIO(newer), path, sha256(newer))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors["newer"] = exc
+        finally:
+            newer_finished.set()
+
+    monkeypatch.setattr(service, "_copy_source", pausing_copy_source)
+    older_thread = threading.Thread(target=complete_older)
+    newer_thread = threading.Thread(target=upload_newer)
+    older_thread.start()
+    assert older_copy_paused.wait(timeout=5)
+    newer_thread.start()
+    newer_overtook_older = newer_finished.wait(timeout=1)
+    release_older_copy.set()
+    older_thread.join(timeout=5)
+    newer_thread.join(timeout=5)
+
+    assert not older_thread.is_alive()
+    assert not newer_thread.is_alive()
+    assert newer_overtook_older is False
+    assert errors == {}
+    assert (tmp_path / path).read_bytes() == newer
+    with ServerManifestDB(service.db_path) as db:
+        assert db.get_file(path)["current_hash"] == sha256(newer)
+
+
+def test_reconciliation_serializes_with_same_path_legacy_publication(
+    tmp_path, monkeypatch
+):
+    path = "data.bin"
+    original = b"original"
+    newer = b"new-data"
+    destination = tmp_path / path
+    destination.write_bytes(original)
+    service = ChunkUploadService(tmp_path)
+    snapshot_ready = threading.Event()
+    release_reconcile = threading.Event()
+    upload_finished = threading.Event()
+    errors = {}
+    original_scan_file = service._scan_file
+
+    def pausing_scan_file(*args, **kwargs):
+        snapshot = original_scan_file(*args, **kwargs)
+        snapshot_ready.set()
+        assert release_reconcile.wait(timeout=5)
+        return snapshot
+
+    def reconcile_original():
+        try:
+            service.reconcile_manifest(path, len(original))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors["reconcile"] = exc
+
+    def upload_newer():
+        try:
+            service.store_whole_file(io.BytesIO(newer), path, sha256(newer))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors["upload"] = exc
+        finally:
+            upload_finished.set()
+
+    monkeypatch.setattr(service, "_scan_file", pausing_scan_file)
+    reconcile_thread = threading.Thread(target=reconcile_original)
+    upload_thread = threading.Thread(target=upload_newer)
+    reconcile_thread.start()
+    assert snapshot_ready.wait(timeout=5)
+    upload_thread.start()
+    upload_overtook_reconcile = upload_finished.wait(timeout=1)
+    release_reconcile.set()
+    reconcile_thread.join(timeout=5)
+    upload_thread.join(timeout=5)
+
+    assert not reconcile_thread.is_alive()
+    assert not upload_thread.is_alive()
+    assert upload_overtook_reconcile is False
+    assert errors == {}
+    assert destination.read_bytes() == newer
+    with ServerManifestDB(service.db_path) as db:
+        assert db.get_file(path)["current_hash"] == sha256(newer)
